@@ -136,25 +136,43 @@ openssl pkcs12 -export -out bot-cert.pfx -inkey bot-key.pem -in bot-cert.pem
 
 **Step 3: Configure API Permissions**
 
+> **Why Application permissions, not Delegated?**
+>
+> | | Delegated | Application |
+> |---|---|---|
+> | Runs as | Signed-in user | App's own identity (no user) |
+> | Requires user login | Yes | No |
+> | Admin consent | Sometimes | Always (one-time) |
+> | Your bot needs it? | ❌ No user session exists | ✅ Correct — daemon/service flow |
+>
+> Your bot runs as a background service on IIS using `ClientSecretCredential`. There is no interactive user signing in at runtime. **Application permissions are the correct and only viable choice.**
+>
+> **Security note:** Application permissions are tenant-wide. Protect the client secret by storing it only in IIS environment variables, never in source code. Rotate it every 24 months or use a certificate instead.
+
 ```
 App Registration > API Permissions > Add a permission
 
-Microsoft Graph > Application permissions:
-  Team.Create
-  TeamMember.ReadWrite.All
-  Channel.Create
-  Channel.ReadBasic.All
-  ChannelMember.ReadWrite.All
-  ChatMessage.Read.All        (for reading channel messages if needed)
-  User.Read.All               (to resolve user identity)
-  Group.ReadWrite.All                          (required for Team creation via Groups)
-  TeamsApp.ReadWrite.All                       (upload app to customer org catalog)
-  TeamsAppInstallation.ReadWriteForTeam.All    (auto-install bot in provisioned Team)
+Select: Microsoft Graph → Application permissions
+(NOT "Delegated permissions")
+
+  ✅ Team.Create                                  (provision new Teams)
+  ✅ TeamMember.ReadWrite.All                     (add owners/members to team)
+  ✅ Channel.Create                               (create approval channel)
+  ✅ Channel.ReadBasic.All                        (read channel metadata)
+  ✅ ChannelMember.ReadWrite.All                  (manage channel members)
+  ✅ User.Read.All                                (resolve user UPNs to AAD IDs)
+  ✅ Group.ReadWrite.All                          (required — Teams are backed by M365 Groups)
+  ✅ TeamsApp.ReadWrite.All                       (upload app to customer org catalog)
+  ✅ TeamsAppInstallation.ReadWriteForTeam.All    (auto-install bot in provisioned Team)
+
+  ❌ Mail.ReadWrite          — do NOT add (not needed, too broad)
+  ❌ Files.ReadWrite.All     — do NOT add (not needed)
+  ❌ Directory.ReadWrite.All — do NOT add (too broad, security risk)
 
 Click "Grant admin consent for <your tenant>"
 ```
 
-> Note: `Group.ReadWrite.All` and `Team.Create` require **admin consent**. These are application permissions (no user sign-in required) for the backend daemon flow.
+> All permissions above require **admin consent**. For customer tenants, admin consent is collected via the `/api/consent/url` endpoint (section 13.4) — each customer admin clicks the consent link once, permanently granting your app access to their tenant.
 
 ---
 
