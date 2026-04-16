@@ -1,6 +1,6 @@
 # End-to-End Implementation Guide
 ## Microsoft Teams Bot + Graph Integration for IRIS CARBON
-### Production-Ready Setup — C# / .NET 8 / Azure
+### Production-Ready Setup — C# / .NET 8 / IIS + Self-Hosted MongoDB
 
 ---
 
@@ -8,7 +8,7 @@
 
 1. [Prerequisites](#1-prerequisites)
 2. [Azure App Registration Setup](#2-azure-app-registration-setup)
-3. [Azure Resources Provisioning](#3-azure-resources-provisioning)
+3. [Azure Resources Provisioning](#3-azure-resources-provisioning) *(Azure Bot + App Registration only)*
 4. [Bot Framework Setup](#4-bot-framework-setup)
 5. [Teams App Manifest](#5-teams-app-manifest)
 6. [.NET Core Solution Scaffold](#6-net-core-solution-scaffold)
@@ -19,12 +19,14 @@
 11. [Application Layer Implementation](#11-application-layer-implementation)
 12. [Bot Layer Implementation](#12-bot-layer-implementation)
 13. [API Layer Implementation](#13-api-layer-implementation)
-14. [Key Vault and Configuration Wiring](#14-key-vault-and-configuration-wiring)
+14. [IIS Configuration and Secrets Management](#14-iis-configuration-and-secrets-management)
 15. [Adaptive Card JSON Templates](#15-adaptive-card-json-templates)
 16. [Local Development and Testing](#16-local-development-and-testing)
-17. [CI/CD Pipeline (Azure DevOps)](#17-cicd-pipeline-azure-devops)
+17. [CI/CD Pipeline — Deploy to IIS](#17-cicd-pipeline--deploy-to-iis)
 18. [Production Deployment Checklist](#18-production-deployment-checklist)
 19. [Post-Deployment Verification](#19-post-deployment-verification)
+20. [Unit Tests — REST API and Services](#20-unit-tests--rest-api-and-services)
+21. [JMeter Load and Automation Test Plan](#21-jmeter-load-and-automation-test-plan)
 
 ---
 
@@ -34,10 +36,12 @@
 
 | Requirement | Detail |
 |---|---|
-| Azure Subscription | Owner or Contributor role required |
+| Azure Subscription | Owner or Contributor role — **only needed for Azure Bot + App Registration (both free)** |
 | Microsoft 365 Tenant | Teams license required for users |
 | Entra ID | Global Admin or Application Admin role for app registration |
 | Teams Admin | Teams admin access to upload custom apps |
+| IIS Server | Windows Server with IIS + .NET 8 Hosting Bundle installed — `https://devbot.iriscarbon.com` |
+| MongoDB Server | Existing internal MongoDB instance (any version ≥ 5.0) |
 
 ### 1.2 Developer Workstation Tools
 
@@ -45,8 +49,7 @@
 - .NET 8 SDK                    https://dotnet.microsoft.com/download
 - Visual Studio 2022 (17.8+)    Community or Enterprise
   OR VS Code with C# Dev Kit
-- Azure CLI (2.55+)             https://learn.microsoft.com/cli/azure/install-azure-cli
-- Azure Functions Core Tools    v4 (if using Azure Functions)
+- Azure CLI (2.55+)             https://learn.microsoft.com/cli/azure/install-azure-cli  (only needed for Azure Bot + App Reg)
 - MongoDB Compass               https://www.mongodb.com/products/compass
 - Bot Framework Emulator        https://github.com/microsoft/BotFramework-Emulator
 - ngrok                         https://ngrok.com  (local tunnel for bot testing)
@@ -69,14 +72,13 @@ Throughout this guide, placeholders use this pattern:
 
 ```text
 <TENANT_ID>         - Your Entra / Azure AD tenant GUID
-<SUBSCRIPTION_ID>   - Your Azure subscription GUID
+<SUBSCRIPTION_ID>   - Your Azure subscription GUID (for Azure Bot creation only)
 <BOT_APP_ID>        - App registration client ID for the bot
-<GRAPH_APP_ID>      - App registration client ID for Graph (can be the same as bot)
-<RESOURCE_GROUP>    - e.g. rg-carbon-teams-prod
-<APP_SERVICE_NAME>  - e.g. app-carbon-teams-prod
-<COSMOS_ACCOUNT>    - e.g. cosmos-carbon-teams-prod
-<KV_NAME>           - e.g. kv-carbon-teams-prod
-<AI_NAME>           - e.g. appi-carbon-teams-prod
+<GRAPH_APP_ID>      - App registration client ID for Graph (same as bot)
+<RESOURCE_GROUP>    - e.g. rg-carbon-teams-bot  (minimal, just for Azure Bot resource)
+<MONGO_HOST>        - Your internal MongoDB server hostname or IP
+<MONGO_DB>          - Database name  e.g. CarbonTeamsDb
+<IIS_SITE_PATH>     - Physical path on IIS server e.g. C:\inetpub\wwwroot\CarbonTeamsBot
 ```
 
 ---
@@ -176,7 +178,7 @@ Add a Scope:
 
 ```
 App Registration > Authentication > Add a Platform > Web
-  Redirect URIs: https://<APP_SERVICE_NAME>.azurewebsites.net/auth/callback
+  Redirect URIs: https://devbot.iriscarbon.com/auth/callback
   
 Front-channel logout URL: (leave blank or set if needed)
 
@@ -196,7 +198,7 @@ Click Save
 | Client ID | `<BOT_APP_ID>` |
 | Tenant ID | `<TENANT_ID>` |
 | Supported Accounts | **Multitenant** — any organizational directory |
-| Client Secret | stored in Key Vault |
+| Client Secret | stored in `web.config` / IIS environment variables |
 | Graph API Permissions | Team.Create, Channel.Create, TeamsApp.ReadWrite.All, TeamsAppInstallation.ReadWriteForTeam.All, etc. |
 | Admin Consent | Granted once by each customer tenant admin |
 
@@ -204,168 +206,63 @@ Click Save
 
 ## 3. Azure Resources Provisioning
 
-### 3.1 Create Resource Group
+> **IRIS CARBON setup:** You host on your own IIS server (`https://devbot.iriscarbon.com`) and use your own MongoDB. The only Azure resources needed are the free **Azure Bot registration** (points to your IIS URL) and an optional **Resource Group** to hold it.
+
+### 3.1 Create Resource Group (minimal — for Azure Bot only)
 
 ```bash
+az login
+az account set --subscription "<SUBSCRIPTION_ID>"
+
 az group create \
-  --name <RESOURCE_GROU
+  --name rg-carbon-teams-bot \
   --location eastus
 ```
 
 ---
 
-### 3.2 Create Azure Cosmos DB for MongoDB API
+### 3.2 MongoDB — Create Database and Collections on Your Server
 
-```bash
-# Create Cosmos DB account with MongoDB API
-az cosmosdb create \
-  --name <COSMOS_ACCOUNT> \
-  --resource-group <RESOURCE_GROUP> \
-  --kind MongoDB \
-  --server-version 6.0 \
-  --default-consistency-level Session \
-  --locations regionName=eastus failoverPriority=0 isZoneRedundant=false
+Connect to your existing MongoDB server with MongoDB Compass or the shell:
 
-# Create the MongoDB database
-az cosmosdb mongodb database create \
-  --account-name <COSMOS_ACCOUNT> \
-  --resource-group <RESOURCE_GROUP> \
-  --name CarbonTeamsDb
+```javascript
+// In mongosh connected to your server
+use CarbonTeamsDb
 
-# Create collections
-for collection in OrgChannelMappings ProvisionedTeams ProvisionedChannels \
-  ApprovalCardInstances ApprovalAuditRecords ValidationAlertInstances; do
-  az cosmosdb mongodb collection create \
-    --account-name <COSMOS_ACCOUNT> \
-    --resource-group <RESOURCE_GROUP> \
-    --database-name CarbonTeamsDb \
-    --name $collection \
-    --shard _id
-done
+db.createCollection("OrgChannelMappings")
+db.createCollection("ProvisionedTeams")
+db.createCollection("ProvisionedChannels")
+db.createCollection("ApprovalCardInstances")
+db.createCollection("ApprovalAuditRecords")
+db.createCollection("ValidationAlertInstances")
 ```
 
-Retrieve the connection string (store in Key Vault):
-```bash
-az cosmosdb keys list \
-  --name <COSMOS_ACCOUNT> \
-  --resource-group <RESOURCE_GROUP> \
-  --type connection-strings \
-  --query "connectionStrings[0].connectionString" -o tsv
-```
+> **Indexes are created automatically** at application startup via `MongoIndexInitializer` — no manual index creation needed.
 
-Connection string format:
+Your connection string format:
 ```text
-mongodb://<COSMOS_ACCOUNT>:<PRIMARY_KEY>@<COSMOS_ACCOUNT>.mongo.cosmos.azure.com:10255/?ssl=true&retrywrites=false&maxIdleTimeMS=120000&appName=@<COSMOS_ACCOUNT>@
-```
+# No auth (internal network)
+mongodb://<MONGO_HOST>:27017
 
-> **Alternatively:** Use MongoDB Atlas hosted on Azure — create a cluster in the same region, enable Private Endpoint, and use the Atlas connection string.
+# With auth
+mongodb://<user>:<password>@<MONGO_HOST>:27017/<MONGO_DB>?authSource=admin
 
-> **Production:** Enable Cosmos DB firewall to allow only App Service outbound IPs, or configure a Private Endpoint.
-
----
-
-### 3.3 Create Azure Key Vault
-
-```bash
-az keyvault create \
-  --name <KV_NAME> \
-  --resource-group <RESOURCE_GROUP> \
-  --location eastus \
-  --sku standard \
-  --enable-rbac-authorization true
-```
-
-Grant your App Service Managed Identity access later (see section 14).
-
----
-
-### 3.4 Create Application Insights
-
-```bash
-# Create Log Analytics Workspace first
-az monitor log-analytics workspace create \
-  --resource-group <RESOURCE_GROUP> \
-  --workspace-name law-carbon-teams-prod \
-  --location eastus
-
-# Create Application Insights
-az monitor app-insights component create \
-  --app <AI_NAME> \
-  --location eastus \
-  --resource-group <RESOURCE_GROUP> \
-  --workspace law-carbon-teams-prod
-```
-
-Record `instrumentationKey` and `connectionString` from the output.
-
----
-
-### 3.5 Create App Service Plan and App Service
-
-```bash
-# App Service Plan (use P1v3 or higher for production)
-az appservice plan create \
-  --name asp-carbon-teams-prod \
-  --resource-group <RESOURCE_GROUP> \
-  --sku P1V3 \
-  --is-linux false \
-  --location eastus
-
-# App Service
-az webapp create \
-  --name <APP_SERVICE_NAME> \
-  --resource-group <RESOURCE_GROUP> \
-  --plan asp-carbon-teams-prod \
-  --runtime "DOTNET|8.0"
-
-# Enable System Assigned Managed Identity
-az webapp identity assign \
-  --name <APP_SERVICE_NAME> \
-  --resource-group <RESOURCE_GROUP>
-```
-
-Record the `principalId` from the identity assign output — needed for Key Vault RBAC.
-
----
-
-### 3.6 Create Azure Service Bus (Optional Async)
-
-```bash
-az servicebus namespace create \
-  --name sb-carbon-teams-prod \
-  --resource-group <RESOURCE_GROUP> \
-  --location eastus \
-  --sku Standard
-
-az servicebus queue create \
-  --name approval-events \
-  --namespace-name sb-carbon-teams-prod \
-  --resource-group <RESOURCE_GROUP>
+# Replica set (recommended for production)
+mongodb://<MONGO_HOST>:27017/<MONGO_DB>?replicaSet=rs0
 ```
 
 ---
 
-### 3.7 Store Secrets in Key Vault
+### 3.3 No Key Vault, No App Service, No Cosmos DB Required
 
-```bash
-# Bot client secret
-az keyvault secret set \
-  --vault-name <KV_NAME> \
-  --name "BotClientSecret" \
-  --value "<BOT_CLIENT_SECRET>"
-
-# MongoDB Connection String
-az keyvault secret set \
-  --vault-name <KV_NAME> \
-  --name "MongoDbConnectionString" \
-  --value "<FULL_MONGODB_CONNECTION_STRING>"
-
-# Audit HMAC Secret (for integrity hash)
-az keyvault secret set \
-  --vault-name <KV_NAME> \
-  --name "AuditHmacSecret" \
-  --value "<RANDOM_256_BIT_HEX>"
-```
+| Azure Service | Status | Replacement |
+|---|---|---|
+| Azure App Service | ❌ Not needed | IIS on `devbot.iriscarbon.com` |
+| Azure Cosmos DB | ❌ Not needed | Your MongoDB server |
+| Azure Key Vault | ❌ Not needed | IIS environment variables / `web.config` encryption |
+| Application Insights | Optional | Use Seq, Elastic, or Windows Event Log |
+| **Azure Bot Service** | ✅ Required (free) | Registers bot identity with Teams |
+| **Azure AD App Registration** | ✅ Required (free) | Bot auth + Graph API |
 
 ---
 
@@ -405,7 +302,7 @@ Azure Bot resource > Channels > Microsoft Teams
 ```
 Azure Bot resource > Configuration
 
-  Messaging Endpoint: https://<APP_SERVICE_NAME>.azurewebsites.net/api/messages
+  Messaging Endpoint: https://devbot.iriscarbon.com/api/messages
 
   Click Apply
 ```
@@ -415,15 +312,6 @@ Azure Bot resource > Configuration
 > ngrok http 5000
 > # Use the https ngrok URL as messaging endpoint during development
 > ```
-
-### 4.4 Enable App Service CORS (if needed)
-
-```bash
-az webapp cors add \
-  --name <APP_SERVICE_NAME> \
-  --resource-group <RESOURCE_GROUP> \
-  --allowed-origins "https://teams.microsoft.com"
-```
 
 ---
 
@@ -476,7 +364,7 @@ teams-manifest/
   ],
   "permissions": ["identity", "messageTeamMembers"],
   "validDomains": [
-    "<APP_SERVICE_NAME>.azurewebsites.net",
+    "devbot.iriscarbon.com",
     "iriscarbon.com"
   ],
   "webApplicationInfo": {
@@ -2173,9 +2061,11 @@ Add `TeamsApp:CatalogId` and `AppBaseUrl` to `appsettings.json`:
 
 ---
 
-## 14. Key Vault and Configuration Wiring
+## 14. IIS Configuration and Secrets Management
 
-### 14.1 appsettings.json (Dev — no secrets)
+> No Azure Key Vault or Managed Identity required. Secrets are stored directly on the IIS server using environment variables or an encrypted `web.config` section.
+
+### 14.1 appsettings.json (checked into source — no secrets)
 
 ```json
 {
@@ -2186,54 +2076,79 @@ Add `TeamsApp:CatalogId` and `AppBaseUrl` to `appsettings.json`:
   },
   "BotAppId": "<BOT_APP_ID>",
   "MicrosoftAppType": "MultiTenant",
-  "KeyVaultUri": "https://<KV_NAME>.vault.azure.net/",
-  "ApplicationInsights": {
-    "ConnectionString": ""
+  "TeamsApp": {
+    "CatalogId": "<YOUR_APPSTORE_OR_ORG_CATALOG_APP_ID>"
   },
+  "AppBaseUrl": "https://devbot.iriscarbon.com",
   "ConnectionStrings": {
     "MongoDb": ""
   }
 }
 ```
 
-### 14.2 Key Vault RBAC for Managed Identity
+### 14.2 IIS Environment Variables (Production Secrets)
 
-```bash
-# Get the App Service Managed Identity principalId
-PRINCIPAL_ID=$(az webapp identity show \
-  --name <APP_SERVICE_NAME> \
-  --resource-group <RESOURCE_GROUP> \
-  --query principalId -o tsv)
+Set these on the IIS server — they override `appsettings.json` at runtime via ASP.NET Core's environment variable configuration provider.
 
-# Get Key Vault resource ID
-KV_ID=$(az keyvault show \
-  --name <KV_NAME> \
-  --resource-group <RESOURCE_GROUP> \
-  --query id -o tsv)
+**Option A — IIS Application Settings (GUI):**
+```
+IIS Manager > Sites > CarbonTeamsBot > Configuration Editor
+  Section: system.webServer/aspNetCore/environmentVariables
 
-# Assign Key Vault Secrets User role
-az role assignment create \
-  --role "Key Vault Secrets User" \
-  --assignee $PRINCIPAL_ID \
-  --scope $KV_ID
+Add:
+  AzureAd__ClientId           = <BOT_APP_ID>
+  AzureAd__ClientSecret       = <BOT_CLIENT_SECRET>
+  AzureAd__TenantId           = common
+  BotAppId                    = <BOT_APP_ID>
+  MicrosoftAppType            = MultiTenant
+  AppBaseUrl                  = https://devbot.iriscarbon.com
+  TeamsApp__CatalogId         = <CATALOG_ID>
+  ConnectionStrings__MongoDb  = mongodb://<MONGO_HOST>:27017/CarbonTeamsDb
+  AuditHmacSecret             = <RANDOM_256_BIT_HEX>
+  ASPNETCORE_ENVIRONMENT      = Production
 ```
 
-### 14.3 App Service Application Settings
-
-```bash
-az webapp config appsettings set \
-  --name <APP_SERVICE_NAME> \
-  --resource-group <RESOURCE_GROUP> \
-  --settings \
-    "AzureAd__TenantId=common" \
-    "AzureAd__ClientId=<BOT_APP_ID>" \
-    "BotAppId=<BOT_APP_ID>" \
-    "MicrosoftAppType=MultiTenant" \
-    "KeyVaultUri=https://<KV_NAME>.vault.azure.net/" \
-    "ApplicationInsights__ConnectionString=@Microsoft.KeyVault(VaultName=<KV_NAME>;SecretName=AppInsightsConnectionString)" \
-    "ConnectionStrings__MongoDb=@Microsoft.KeyVault(VaultName=<KV_NAME>;SecretName=MongoDbConnectionString)" \
-    "AzureAd__ClientSecret=@Microsoft.KeyVault(VaultName=<KV_NAME>;SecretName=BotClientSecret)"
+**Option B — In `web.config` environmentVariables block:**
+```xml
+<aspNetCore processPath="dotnet" arguments=".\Carbon.Teams.Api.dll" stdoutLogEnabled="false">
+  <environmentVariables>
+    <environmentVariable name="ASPNETCORE_ENVIRONMENT" value="Production" />
+    <environmentVariable name="AzureAd__ClientId" value="<BOT_APP_ID>" />
+    <environmentVariable name="AzureAd__ClientSecret" value="<BOT_CLIENT_SECRET>" />
+    <environmentVariable name="AzureAd__TenantId" value="common" />
+    <environmentVariable name="BotAppId" value="<BOT_APP_ID>" />
+    <environmentVariable name="MicrosoftAppType" value="MultiTenant" />
+    <environmentVariable name="AppBaseUrl" value="https://devbot.iriscarbon.com" />
+    <environmentVariable name="TeamsApp__CatalogId" value="<CATALOG_ID>" />
+    <environmentVariable name="ConnectionStrings__MongoDb" value="mongodb://<MONGO_HOST>:27017/CarbonTeamsDb" />
+    <environmentVariable name="AuditHmacSecret" value="<RANDOM_256_BIT_HEX>" />
+  </environmentVariables>
+</aspNetCore>
 ```
+
+> **Security:** If using Option B encrypt the `web.config` section with ASP.NET Data Protection:
+> ```cmd
+> aspnet_regiis -pef "configuration/system.webServer/aspNetCore/environmentVariables" "C:\inetpub\wwwroot\CarbonTeamsBot"
+> ```
+
+### 14.3 Remove Key Vault from Program.cs
+
+The original Key Vault builder code is not needed. Ensure `Program.cs` does **not** reference `AddAzureKeyVault`:
+
+```csharp
+// Program.cs — IIS/self-hosted version
+var builder = WebApplication.CreateBuilder(args);
+
+// Standard config providers only: appsettings.json + environment variables
+// No AddAzureKeyVault() needed
+builder.Services.AddInfrastructure(builder.Configuration);
+builder.Services.AddApplication();
+// ... rest of setup
+```
+
+### 14.4 InfrastructureServiceExtensions — Remove Managed Identity References
+
+Replace any `ManagedIdentityCredential` usage in Graph client factory with `ClientSecretCredential` (already done in section 10.2.1 — no further changes needed).
 
 ---
 
@@ -2409,11 +2324,12 @@ Create `appsettings.Development.json` (never commit to Git):
   },
   "BotAppId": "<BOT_APP_ID>",
   "MicrosoftAppType": "MultiTenant",
-  "ConnectionStrings": {
-    "MongoDb": "mongodb://localhost:27017"
+  "AppBaseUrl": "https://<NGROK_ID>.ngrok.io",
+  "TeamsApp": {
+    "CatalogId": "<CATALOG_ID>"
   },
-  "ApplicationInsights": {
-    "ConnectionString": ""
+  "ConnectionStrings": {
+    "MongoDb": "mongodb://<MONGO_HOST>:27017/CarbonTeamsDb"
   }
 }
 ```
@@ -2460,28 +2376,59 @@ dotnet test Carbon.Teams.Tests/Carbon.Teams.Tests.csproj --verbosity normal
 
 ---
 
-## 17. CI/CD Pipeline (Azure DevOps)
+## 17. CI/CD Pipeline — Deploy to IIS
 
-### 17.1 azure-pipelines.yml
+### 17.1 Build and Publish
+
+```bash
+# Build and publish self-contained for Windows / IIS
+dotnet publish Carbon.Teams.Api/Carbon.Teams.Api.csproj \
+  -c Release \
+  -r win-x64 \
+  --self-contained false \
+  -o ./publish/CarbonTeamsBot
+```
+
+### 17.2 Deploy to IIS (xcopy / robocopy)
+
+Run on the server or via a CI agent that has network/file access to the IIS server:
+
+```powershell
+# Stop the IIS site to release file locks
+Invoke-Command -ComputerName <IIS_SERVER> -ScriptBlock {
+    Stop-WebSite -Name "CarbonTeamsBot"
+}
+
+# Copy published output to IIS root
+robocopy .\publish\CarbonTeamsBot \
+  \\<IIS_SERVER>\<IIS_SITE_PATH> /MIR /XF web.config
+# /XF web.config  — preserves the existing web.config (which holds env vars)
+
+# Restart site
+Invoke-Command -ComputerName <IIS_SERVER> -ScriptBlock {
+    Start-WebSite -Name "CarbonTeamsBot"
+}
+```
+
+> **Alternative:** Use Visual Studio Publish > Web Deploy profile pointing to `https://devbot.iriscarbon.com` (Web Deploy must be installed on the IIS server).
+
+### 17.3 Azure DevOps Pipeline (Optional)
 
 ```yaml
+# azure-pipelines.yml
 trigger:
   branches:
     include:
       - main
-      - release/*
 
 pool:
   vmImage: windows-latest
 
 variables:
   buildConfiguration: Release
-  appServiceName: $(APP_SERVICE_NAME)
-  resourceGroup: $(RESOURCE_GROUP)
 
 stages:
   - stage: Build
-    displayName: Build and Test
     jobs:
       - job: Build
         steps:
@@ -2496,7 +2443,7 @@ stages:
             displayName: Build
 
           - script: dotnet test Carbon.Teams.Tests/Carbon.Teams.Tests.csproj -c $(buildConfiguration) --no-build
-            displayName: Tests
+            displayName: Test
 
           - task: DotNetCoreCLI@2
             displayName: Publish API
@@ -2509,78 +2456,87 @@ stages:
           - publish: $(Build.ArtifactStagingDirectory)/api
             artifact: drop
 
-  - stage: Deploy_Prod
-    displayName: Deploy to Production
+  - stage: Deploy
     dependsOn: Build
     condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
     jobs:
-      - deployment: DeployProd
+      - deployment: DeployIIS
         environment: production
         strategy:
           runOnce:
             deploy:
               steps:
-                - task: AzureWebApp@1
-                  displayName: Deploy to App Service
+                - task: IISWebAppDeploymentOnMachineGroup@0
+                  displayName: Deploy to IIS
                   inputs:
-                    azureSubscription: $(AZURE_SERVICE_CONNECTION)
-                    appType: webApp
-                    appName: $(appServiceName)
-                    package: $(Pipeline.Workspace)/drop/**/*.zip
-
-                # MongoDB indexes are created automatically at application startup
-                # via MongoIndexInitializer — no migration step required here
+                    WebSiteName: CarbonTeamsBot
+                    Package: $(Pipeline.Workspace)/drop/**/*.zip
+                    TakeAppOfflineFlag: true
+                    XmlTransformation: false
+                    XmlVariableSubstitution: false
+                    # web.config is NOT overwritten — env vars set directly on server
 ```
 
 ---
 
 ## 18. Production Deployment Checklist
 
-### 18.1 Azure Infrastructure
+### 18.1 Azure Resources (Minimal)
 
-- [ ] Resource group created in target region
-- [ ] App Registration created with correct permissions
-- [ ] Admin consent granted for all Graph permissions
-- [ ] Azure Bot resource created and Teams channel enabled
-- [ ] App Service Plan P1v3 or higher
-- [ ] App Service created with .NET 8 runtime
-- [ ] System-assigned Managed Identity enabled on App Service
-- [ ] Azure Cosmos DB for MongoDB API account and database created
-- [ ] Azure Key Vault created with RBAC enabled
-- [ ] Managed Identity granted `Key Vault Secrets User` role on KV
-- [ ] All secrets stored in Key Vault
-- [ ] App Service configured with Key Vault references
-- [ ] Application Insights created and connection string in KV
-- [ ] App Service messaging endpoint set in Azure Bot
-- [ ] HTTPS only enforced on App Service
-- [ ] TLS 1.2 minimum on App Service
-- [ ] Cosmos DB firewall configured: App Service IPs allowed or Private Endpoint enabled
+- [ ] Azure AD App Registration created with correct Graph permissions
+- [ ] Admin consent granted for all Graph permissions in IRIS CARBON's own tenant
+- [ ] Azure Bot resource created with F0 (free) tier
+- [ ] Teams channel enabled on Azure Bot
+- [ ] Bot messaging endpoint set to `https://devbot.iriscarbon.com/api/messages`
 
-### 18.2 Application Configuration
+### 18.2 IIS Server Setup
 
-- [ ] `appsettings.Production.json` has no embedded secrets
-- [ ] All sensitive config reads from Key Vault via managed identity
-- [ ] Bot App ID and tenant ID correct in app settings
-- [ ] MongoDB indexes created at startup (MongoIndexInitializer runs automatically on app start)
-- [ ] Unique partial indexes verified via MongoDB Compass or Azure Cosmos DB Data Explorer
-- [ ] Application Insights SDK integrated and telemetry verified
+- [ ] .NET 8 Hosting Bundle installed on IIS server
+- [ ] IIS site `CarbonTeamsBot` created pointing to `<IIS_SITE_PATH>`
+- [ ] HTTPS binding on port 443 with valid SSL cert for `devbot.iriscarbon.com`
+- [ ] HTTP → HTTPS redirect configured (URL Rewrite rule or HSTS)
+- [ ] TLS 1.2 minimum enforced (disable TLS 1.0 / 1.1)
+- [ ] All environment variables set in IIS (section 14.2)
+- [ ] `web.config` environment variable block encrypted with `aspnet_regiis` if used
+- [ ] Application pool: No Managed Code, .NET CLR = No Managed Code (Kestrel handles it)
+- [ ] `ASPNETCORE_ENVIRONMENT=Production` set
 
-### 18.3 Teams App
+### 18.3 MongoDB
+
+- [ ] `CarbonTeamsDb` database created on MongoDB server
+- [ ] All 6 collections created (indexes auto-created at app startup)
+- [ ] MongoDB accessible from IIS server on port 27017
+- [ ] MongoDB firewall allows IIS server IP only
+- [ ] Connection string verified end-to-end from server
+- [ ] Unique partial indexes verified via MongoDB Compass after first startup
+
+### 18.4 Application Configuration
+
+- [ ] `appsettings.json` has no embedded secrets (empty strings only)
+- [ ] `appsettings.Development.json` excluded from deployment and in `.gitignore`
+- [ ] `BotAppId` and `AzureAd__ClientId` match the App Registration
+- [ ] `MicrosoftAppType=MultiTenant` and `AzureAd__TenantId=common` set
+- [ ] `AuditHmacSecret` is a cryptographically random 256-bit hex value
+- [ ] MongoDB indexes created at startup (MongoIndexInitializer runs automatically)
+
+### 18.5 Teams App
 
 - [ ] Teams app manifest `id` matches `<BOT_APP_ID>`
-- [ ] Manifest uploaded to Teams Admin Center
+- [ ] `validDomains` in manifest contains `devbot.iriscarbon.com`
+- [ ] Manifest package uploaded to Teams Admin Center
 - [ ] App approved and published to tenant
-- [ ] Bot tested with real Teams user (invite bot to a channel)
+- [ ] Bot tested: invite bot to a channel → it appears in the channel
+- [ ] Approval card posted and Approve/Reject buttons functional
 
-### 18.4 Security
+### 18.6 Security
 
-- [ ] Client secret rotation scheduled (or certificate used)
-- [ ] Least-privilege Graph permissions only
-- [ ] No hard-coded secrets in source code
-- [ ] `.gitignore` excludes dev secrets and PFX files
+- [ ] Client secret rotation scheduled (every 24 months) OR certificate credential used
+- [ ] Least-privilege Graph permissions only (no extra scopes)
+- [ ] No hard-coded secrets in source code or `appsettings.json`
+- [ ] `.gitignore` excludes `appsettings.Development.json`, `*.pfx`, `*.pem`, `*.key`
 - [ ] OWASP Top 10 review complete
-- [ ] All card payload values treated as untrusted server-side
-- [ ] Audit records verified insert-only (DB permission review)
+- [ ] All bot card payload values validated server-side before processing
+- [ ] Audit records verified as insert-only (MongoDB user has no delete permission on ApprovalAuditRecords)
 - [ ] Correlation IDs present on all log entries
 
 ---
@@ -2591,7 +2547,7 @@ stages:
 
 ```bash
 # 1. Provision a Team
-curl -X POST https://<APP_SERVICE_NAME>.azurewebsites.net/api/teams/provision/team \
+curl -X POST https://devbot.iriscarbon.com/api/teams/provision/team \
   -H "Content-Type: application/json" \
   -d '{
     "companyId": "ORG-TEST-001",
@@ -2602,7 +2558,7 @@ curl -X POST https://<APP_SERVICE_NAME>.azurewebsites.net/api/teams/provision/te
   }'
 
 # 2. Provision a Channel
-curl -X POST https://<APP_SERVICE_NAME>.azurewebsites.net/api/teams/provision/channel \
+curl -X POST https://devbot.iriscarbon.com/api/teams/provision/channel \
   -H "Content-Type: application/json" \
   -d '{
     "companyId": "ORG-TEST-001",
@@ -2612,17 +2568,17 @@ curl -X POST https://<APP_SERVICE_NAME>.azurewebsites.net/api/teams/provision/ch
   }'
 
 # 3. Map Org to Channel
-curl -X POST https://<APP_SERVICE_NAME>.azurewebsites.net/api/teams/channels \
+curl -X POST https://devbot.iriscarbon.com/api/teams/channels \
   -H "Content-Type: application/json" \
   -d '{
     "companyId": "ORG-TEST-001",
     "teamId": "<TEAM_ID>",
     "channelId": "<CHANNEL_ID>",
-    "tenantId": "<TENANT_ID>"
+    "tenantId": "<CUSTOMER_TENANT_ID>"
   }'
 
 # 4. Post Approval Card
-curl -X POST https://<APP_SERVICE_NAME>.azurewebsites.net/api/teams/cards/approval \
+curl -X POST https://devbot.iriscarbon.com/api/teams/cards/approval \
   -H "Content-Type: application/json" \
   -d '{
     "companyId": "ORG-TEST-001",
@@ -2638,13 +2594,23 @@ curl -X POST https://<APP_SERVICE_NAME>.azurewebsites.net/api/teams/cards/approv
   }'
 ```
 
-### 19.2 Application Insights Verification
+### 19.2 Verify IIS Logs and MongoDB
 
+```powershell
+# Check IIS stdout logs on the server
+Get-Content "C:\inetpub\logs\LogFiles\W3SVC1\*.log" -Tail 50
+
+# Or check the ASP.NET Core stdout log if enabled in web.config
+# stdoutLogEnabled="true" stdoutLogFile=".\logs\stdout"
 ```
-Azure Portal > Application Insights > <AI_NAME>
-  Live Metrics    — verify requests flowing
-  Failures        — verify 0 errors on smoke tests
-  Performance     — verify response times acceptable
+
+```javascript
+// In MongoDB Compass or mongosh — verify collections received data
+use CarbonTeamsDb
+db.OrgChannelMappings.find().pretty()
+db.ProvisionedTeams.find().pretty()
+db.ApprovalCardInstances.find().pretty()
+```
   Logs            — query:
     requests | where cloud_RoleName == "Carbon.Teams.Api"
     | summarize count() by resultCode
@@ -2654,7 +2620,7 @@ Azure Portal > Application Insights > <AI_NAME>
 
 ```bash
 # Verify audit record integrity
-curl https://<APP_SERVICE_NAME>.azurewebsites.net/api/audit/<AUDIT_ID>/verify
+curl https://devbot.iriscarbon.com/api/audit/<AUDIT_ID>/verify
 ```
 
 Expected response:
@@ -2672,15 +2638,977 @@ Expected response:
 
 | Variable | Source | Used In |
 |---|---|---|
-| `AzureAd__TenantId` | App Settings | Graph, Bot auth |
-| `AzureAd__ClientId` | App Settings | Graph, Bot auth |
-| `AzureAd__ClientSecret` | KV Reference | Graph, Bot auth |
-| `BotAppId` | App Settings | Bot identity |
-| `ConnectionStrings__MongoDb` | KV Reference | MongoDB |
-| `ApplicationInsights__ConnectionString` | KV Reference | Telemetry |
-| `AuditHmacSecret` | KV Secret (via config) | Audit hash |
-| `KeyVaultUri` | App Settings | KV SDK bootstrap |
+| `AzureAd__TenantId` | IIS env var | Graph, Bot auth |
+| `AzureAd__ClientId` | IIS env var | Graph, Bot auth |
+| `AzureAd__ClientSecret` | IIS env var | Graph, Bot auth |
+| `BotAppId` | IIS env var | Bot identity |
+| `MicrosoftAppType` | IIS env var | Bot identity |
+| `ConnectionStrings__MongoDb` | IIS env var | MongoDB |
+| `AuditHmacSecret` | IIS env var | Audit hash |
+| `AppBaseUrl` | IIS env var | Consent redirect URI |
+| `TeamsApp__CatalogId` | IIS env var | Bot auto-install |
 
 ---
 
-*End of Implementation Guide — Version 1.0 — 2026-04-16*
+---
+
+## 20. Unit Tests — REST API and Services
+
+### 20.1 NuGet Packages for Test Project
+
+```xml
+<!-- Carbon.Teams.Tests/Carbon.Teams.Tests.csproj -->
+<ItemGroup>
+  <PackageReference Include="xunit"                            Version="2.9.0" />
+  <PackageReference Include="xunit.runner.visualstudio"        Version="2.8.2" />
+  <PackageReference Include="Microsoft.NET.Test.Sdk"           Version="17.11.0" />
+  <PackageReference Include="Moq"                              Version="4.20.70" />
+  <PackageReference Include="FluentAssertions"                 Version="6.12.0" />
+  <PackageReference Include="Microsoft.AspNetCore.Mvc.Testing" Version="8.0.0" />
+  <PackageReference Include="MongoDB.Driver"                   Version="2.26.0" />
+</ItemGroup>
+```
+
+---
+
+### 20.2 Controller Unit Tests — ProvisioningController
+
+```csharp
+// Carbon.Teams.Tests/Controllers/ProvisioningControllerTests.cs
+using Carbon.Teams.Api.Controllers;
+using Carbon.Teams.Application.Interfaces;
+using Carbon.Teams.Contracts.Requests;
+using Carbon.Teams.Contracts.Responses;
+using FluentAssertions;
+using Microsoft.AspNetCore.Mvc;
+using Moq;
+using Xunit;
+
+namespace Carbon.Teams.Tests.Controllers
+{
+    public class ProvisioningControllerTests
+    {
+        private readonly Mock<ITeamsProvisioningService> _provisioningServiceMock;
+        private readonly ProvisioningController _controller;
+
+        public ProvisioningControllerTests()
+        {
+            _provisioningServiceMock = new Mock<ITeamsProvisioningService>();
+            _controller = new ProvisioningController(_provisioningServiceMock.Object);
+        }
+
+        [Fact]
+        public async Task ProvisionTeam_ValidRequest_Returns200WithTeamId()
+        {
+            // Arrange
+            var request = new CreateTeamRequest
+            {
+                CompanyId = "COMP-001",
+                TeamDisplayName = "Carbon Test",
+                TeamDescription = "Test team",
+                Owners = new List<string> { "admin@test.com" },
+                Members = new List<string>()
+            };
+
+            var expectedResponse = new CreateTeamResponse { TeamId = "team-abc-123" };
+
+            _provisioningServiceMock
+                .Setup(s => s.CreateTeamAsync(request, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(expectedResponse);
+
+            // Act
+            var result = await _controller.ProvisionTeam(request, CancellationToken.None);
+
+            // Assert
+            var ok = result.Should().BeOfType<OkObjectResult>().Subject;
+            var body = ok.Value.Should().BeOfType<CreateTeamResponse>().Subject;
+            body.TeamId.Should().Be("team-abc-123");
+        }
+
+        [Fact]
+        public async Task ProvisionTeam_InvalidModel_Returns400()
+        {
+            // Arrange
+            _controller.ModelState.AddModelError("CompanyId", "Required");
+            var request = new CreateTeamRequest();
+
+            // Act
+            var result = await _controller.ProvisionTeam(request, CancellationToken.None);
+
+            // Assert
+            result.Should().BeOfType<BadRequestObjectResult>();
+        }
+
+        [Fact]
+        public async Task DeactivateMapping_ValidCompanyId_Returns204()
+        {
+            // Arrange
+            _provisioningServiceMock
+                .Setup(s => s.DeactivateMappingAsync("COMP-001", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            // Act
+            var result = await _controller.DeactivateMapping("COMP-001", CancellationToken.None);
+
+            // Assert
+            result.Should().BeOfType<NoContentResult>();
+        }
+
+        [Fact]
+        public async Task ProvisionChannel_ServiceThrows_Returns500()
+        {
+            // Arrange
+            var request = new CreateChannelRequest
+            {
+                CompanyId = "COMP-001",
+                TeamId = "team-123",
+                ChannelName = "carbon-approvals"
+            };
+
+            _provisioningServiceMock
+                .Setup(s => s.CreateChannelAsync(request, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new InvalidOperationException("Graph API error"));
+
+            // Act
+            Func<Task> act = async () => await _controller.ProvisionChannel(request, CancellationToken.None);
+
+            // Assert
+            await act.Should().ThrowAsync<InvalidOperationException>()
+                .WithMessage("Graph API error");
+        }
+    }
+}
+```
+
+---
+
+### 20.3 Controller Unit Tests — ApprovalCardsController
+
+```csharp
+// Carbon.Teams.Tests/Controllers/ApprovalCardsControllerTests.cs
+using Carbon.Teams.Api.Controllers;
+using Carbon.Teams.Application.Interfaces;
+using Carbon.Teams.Contracts.Requests;
+using Carbon.Teams.Contracts.Responses;
+using FluentAssertions;
+using Microsoft.AspNetCore.Mvc;
+using Moq;
+using Xunit;
+
+namespace Carbon.Teams.Tests.Controllers
+{
+    public class ApprovalCardsControllerTests
+    {
+        private readonly Mock<IApprovalCardService> _cardServiceMock;
+        private readonly ApprovalCardsController _controller;
+
+        public ApprovalCardsControllerTests()
+        {
+            _cardServiceMock = new Mock<IApprovalCardService>();
+            _controller = new ApprovalCardsController(_cardServiceMock.Object);
+        }
+
+        [Fact]
+        public async Task PostApprovalCard_ValidRequest_Returns200WithCardInstanceId()
+        {
+            // Arrange
+            var request = new PostApprovalCardRequest
+            {
+                CompanyId = "COMP-001",
+                SectionId = "SEC-5001",
+                DocumentId = "DOC-2001",
+                DocumentVersion = "v1",
+                SectionName = "Risk Factors",
+                SectionVersionHash = "abc123"
+            };
+
+            var response = new PostApprovalCardResponse
+            {
+                CardInstanceId = Guid.Parse("11111111-0000-0000-0000-000000000001")
+            };
+
+            _cardServiceMock
+                .Setup(s => s.PostApprovalCardAsync(request, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(response);
+
+            // Act
+            var result = await _controller.PostApprovalCard(request, CancellationToken.None);
+
+            // Assert
+            var ok = result.Should().BeOfType<OkObjectResult>().Subject;
+            var body = ok.Value.Should().BeOfType<PostApprovalCardResponse>().Subject;
+            body.CardInstanceId.Should().NotBeEmpty();
+        }
+
+        [Fact]
+        public async Task PostApprovalCard_DuplicateCard_Returns409()
+        {
+            // Arrange
+            var request = new PostApprovalCardRequest
+            {
+                CompanyId = "COMP-001",
+                SectionId = "SEC-5001",
+                DocumentId = "DOC-2001",
+                DocumentVersion = "v1",
+                SectionVersionHash = "abc123"
+            };
+
+            _cardServiceMock
+                .Setup(s => s.PostApprovalCardAsync(request, It.IsAny<CancellationToken>()))
+                .ThrowsAsync(new DuplicateCardException("Active card already exists for this section."));
+
+            // Act
+            var result = await _controller.PostApprovalCard(request, CancellationToken.None);
+
+            // Assert
+            result.Should().BeOfType<ConflictObjectResult>();
+        }
+    }
+}
+```
+
+---
+
+### 20.4 Controller Unit Tests — ConsentController
+
+```csharp
+// Carbon.Teams.Tests/Controllers/ConsentControllerTests.cs
+using Carbon.Teams.Api.Controllers;
+using Carbon.Teams.Application.Interfaces;
+using FluentAssertions;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.Logging.Abstractions;
+using Moq;
+using Xunit;
+
+namespace Carbon.Teams.Tests.Controllers
+{
+    public class ConsentControllerTests
+    {
+        private readonly ConsentController _controller;
+        private readonly Mock<ITenantOnboardingService> _onboardingMock;
+
+        public ConsentControllerTests()
+        {
+            _onboardingMock = new Mock<ITenantOnboardingService>();
+
+            var config = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    { "AzureAd:ClientId", "app-id-test" },
+                    { "AppBaseUrl", "https://devbot.iriscarbon.com" }
+                })
+                .Build();
+
+            _controller = new ConsentController(
+                config,
+                _onboardingMock.Object,
+                NullLogger<ConsentController>.Instance);
+        }
+
+        [Fact]
+        public void GetConsentUrl_ValidParams_ReturnsConsentUrlContainingClientId()
+        {
+            // Act
+            var result = _controller.GetConsentUrl("COMP-001", "tenant-guid-123");
+
+            // Assert
+            var ok = result.Should().BeOfType<OkObjectResult>().Subject;
+            var json = System.Text.Json.JsonSerializer.Serialize(ok.Value);
+            json.Should().Contain("app-id-test");
+            json.Should().Contain("tenant-guid-123");
+            json.Should().Contain("adminconsent");
+        }
+
+        [Fact]
+        public async Task ConsentCallback_ErrorParam_ReturnsBadRequest()
+        {
+            // Act
+            var result = await _controller.ConsentCallback(
+                tenant: null, state: null,
+                error: "access_denied",
+                error_description: "User cancelled",
+                ct: CancellationToken.None);
+
+            // Assert
+            result.Should().BeOfType<BadRequestObjectResult>();
+        }
+
+        [Fact]
+        public async Task ConsentCallback_ValidCallback_CallsOnboardingService()
+        {
+            // Arrange
+            _onboardingMock
+                .Setup(s => s.CompleteConsentAsync("COMP-001", "tenant-xyz", It.IsAny<CancellationToken>()))
+                .Returns(Task.CompletedTask);
+
+            // Act
+            var result = await _controller.ConsentCallback(
+                tenant: "tenant-xyz", state: "COMP-001",
+                error: null, error_description: null,
+                ct: CancellationToken.None);
+
+            // Assert
+            result.Should().BeOfType<OkObjectResult>();
+            _onboardingMock.Verify(
+                s => s.CompleteConsentAsync("COMP-001", "tenant-xyz", It.IsAny<CancellationToken>()),
+                Times.Once);
+        }
+    }
+}
+```
+
+---
+
+### 20.5 Service Unit Tests — ApprovalActionService
+
+```csharp
+// Carbon.Teams.Tests/Services/ApprovalActionServiceTests.cs
+using Carbon.Teams.Application.Services;
+using Carbon.Teams.Domain.Entities;
+using Carbon.Teams.Application.Interfaces;
+using Carbon.Teams.Contracts.Commands;
+using FluentAssertions;
+using Moq;
+using Xunit;
+
+namespace Carbon.Teams.Tests.Services
+{
+    public class ApprovalActionServiceTests
+    {
+        private readonly Mock<IApprovalCardInstanceRepository> _cardRepoMock;
+        private readonly Mock<IAuditRepository> _auditRepoMock;
+        private readonly Mock<IAuditHashService> _hashServiceMock;
+        private readonly Mock<IAuthorizationService> _authServiceMock;
+        private readonly ApprovalActionService _service;
+
+        public ApprovalActionServiceTests()
+        {
+            _cardRepoMock   = new Mock<IApprovalCardInstanceRepository>();
+            _auditRepoMock  = new Mock<IAuditRepository>();
+            _hashServiceMock = new Mock<IAuditHashService>();
+            _authServiceMock = new Mock<IAuthorizationService>();
+
+            _service = new ApprovalActionService(
+                _cardRepoMock.Object,
+                _auditRepoMock.Object,
+                _hashServiceMock.Object,
+                _authServiceMock.Object);
+        }
+
+        [Fact]
+        public async Task HandleApproveAsync_AuthorizedUser_UpdatesCardToApproved()
+        {
+            // Arrange
+            var cardId = Guid.NewGuid();
+            var command = new ApproveCommand
+            {
+                CompanyId = "COMP-001",
+                SectionId = "SEC-001",
+                CardInstanceId = cardId,
+                UserId = "user-aad-001",
+                SectionVersionHash = "hash-001"
+            };
+
+            var card = new ApprovalCardInstance
+            {
+                CardInstanceId = cardId,
+                CompanyId = "COMP-001",
+                SectionId = "SEC-001",
+                Status = ApprovalCardStatus.Active,
+                SectionVersionHash = "hash-001"
+            };
+
+            _authServiceMock
+                .Setup(a => a.CanApproveSectionAsync(command.UserId, command.CompanyId, command.SectionId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(AuthorizationResult.Authorized());
+
+            _cardRepoMock
+                .Setup(r => r.GetByIdAsync(cardId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(card);
+
+            _hashServiceMock
+                .Setup(h => h.ComputeHash(It.IsAny<object>()))
+                .Returns("audit-hash-xyz");
+
+            // Act
+            await _service.HandleApproveAsync(command, CancellationToken.None);
+
+            // Assert
+            _cardRepoMock.Verify(r => r.UpdateAsync(
+                It.Is<ApprovalCardInstance>(c => c.Status == ApprovalCardStatus.Approved),
+                It.IsAny<CancellationToken>()), Times.Once);
+
+            _auditRepoMock.Verify(r => r.InsertAsync(
+                It.IsAny<ApprovalAuditRecord>(),
+                It.IsAny<CancellationToken>()), Times.Once);
+        }
+
+        [Fact]
+        public async Task HandleApproveAsync_UnauthorizedUser_ThrowsForbidden()
+        {
+            // Arrange
+            var command = new ApproveCommand
+            {
+                CompanyId = "COMP-001",
+                SectionId = "SEC-001",
+                CardInstanceId = Guid.NewGuid(),
+                UserId = "unauthorized-user"
+            };
+
+            _authServiceMock
+                .Setup(a => a.CanApproveSectionAsync(command.UserId, command.CompanyId, command.SectionId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(AuthorizationResult.Forbidden("Not an approver"));
+
+            // Act
+            Func<Task> act = async () => await _service.HandleApproveAsync(command, CancellationToken.None);
+
+            // Assert
+            await act.Should().ThrowAsync<UnauthorizedAccessException>()
+                .WithMessage("*Not an approver*");
+        }
+
+        [Fact]
+        public async Task HandleApproveAsync_HashMismatch_ThrowsConcurrencyException()
+        {
+            // Arrange
+            var cardId = Guid.NewGuid();
+            var command = new ApproveCommand
+            {
+                CompanyId = "COMP-001",
+                SectionId = "SEC-001",
+                CardInstanceId = cardId,
+                UserId = "user-001",
+                SectionVersionHash = "STALE_HASH"
+            };
+
+            var card = new ApprovalCardInstance
+            {
+                CardInstanceId = cardId,
+                Status = ApprovalCardStatus.Active,
+                SectionVersionHash = "CURRENT_HASH"
+            };
+
+            _authServiceMock
+                .Setup(a => a.CanApproveSectionAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(AuthorizationResult.Authorized());
+
+            _cardRepoMock
+                .Setup(r => r.GetByIdAsync(cardId, It.IsAny<CancellationToken>()))
+                .ReturnsAsync(card);
+
+            // Act
+            Func<Task> act = async () => await _service.HandleApproveAsync(command, CancellationToken.None);
+
+            // Assert
+            await act.Should().ThrowAsync<ConcurrencyException>()
+                .WithMessage("*version has changed*");
+        }
+    }
+}
+```
+
+---
+
+### 20.6 Service Unit Tests — AuditHashService
+
+```csharp
+// Carbon.Teams.Tests/Services/AuditHashServiceTests.cs
+using Carbon.Teams.Infrastructure.Security;
+using FluentAssertions;
+using Microsoft.Extensions.Configuration;
+using Xunit;
+
+namespace Carbon.Teams.Tests.Services
+{
+    public class AuditHashServiceTests
+    {
+        private readonly AuditHashService _service;
+
+        public AuditHashServiceTests()
+        {
+            var config = new ConfigurationBuilder()
+                .AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    { "AuditHmacSecret", "test-secret-key-32-chars-minimum!" }
+                })
+                .Build();
+
+            _service = new AuditHashService(config);
+        }
+
+        [Fact]
+        public void ComputeHash_SamePayload_ReturnsSameHash()
+        {
+            var payload = new { userId = "u1", action = "Approve", sectionId = "SEC-001" };
+
+            var hash1 = _service.ComputeHash(payload);
+            var hash2 = _service.ComputeHash(payload);
+
+            hash1.Should().Be(hash2);
+        }
+
+        [Fact]
+        public void ComputeHash_DifferentPayload_ReturnsDifferentHash()
+        {
+            var payload1 = new { userId = "u1", action = "Approve" };
+            var payload2 = new { userId = "u1", action = "Reject" };
+
+            var hash1 = _service.ComputeHash(payload1);
+            var hash2 = _service.ComputeHash(payload2);
+
+            hash1.Should().NotBe(hash2);
+        }
+
+        [Fact]
+        public void Verify_CorrectHash_ReturnsTrue()
+        {
+            var payload = new { userId = "u1", action = "Approve" };
+            var hash = _service.ComputeHash(payload);
+
+            _service.Verify(payload, hash).Should().BeTrue();
+        }
+
+        [Fact]
+        public void Verify_TamperedHash_ReturnsFalse()
+        {
+            var payload = new { userId = "u1", action = "Approve" };
+            _service.Verify(payload, "tampered-hash").Should().BeFalse();
+        }
+    }
+}
+```
+
+---
+
+### 20.7 Run All Tests
+
+```bash
+# Run all unit tests with coverage
+dotnet test Carbon.Teams.Tests/Carbon.Teams.Tests.csproj \
+  --verbosity normal \
+  --collect:"XPlat Code Coverage" \
+  --results-directory ./TestResults
+
+# View coverage report (requires reportgenerator)
+dotnet tool install -g dotnet-reportgenerator-globaltool
+reportgenerator \
+  -reports:"./TestResults/**/coverage.cobertura.xml" \
+  -targetdir:"./TestResults/CoverageReport" \
+  -reporttypes:Html
+```
+
+---
+
+## 21. JMeter Load and Automation Test Plan
+
+### 21.1 Prerequisites
+
+```text
+- Apache JMeter 5.6+    https://jmeter.apache.org/download_jmeter.cgi
+- Java 11+              required by JMeter
+- JMeter Plugins Manager (optional — for JSON Path extractor)
+```
+
+---
+
+### 21.2 Test Plan Structure
+
+```text
+CarbonTeamsBot_TestPlan.jmx
+└── Thread Group: API Smoke Tests (1 user, 1 iteration)
+│   ├── HTTP Request: POST /api/teams/provision/team
+│   ├── JSON Extractor: teamId from response
+│   ├── HTTP Request: POST /api/teams/provision/channel
+│   ├── JSON Extractor: channelId from response
+│   ├── HTTP Request: POST /api/teams/channels  (map org)
+│   ├── HTTP Request: POST /api/teams/cards/approval
+│   ├── JSON Extractor: cardInstanceId from response
+│   └── Response Assertion: all 200/204
+└── Thread Group: Load Test — Post Approval Cards (50 users, 10 iterations)
+    ├── HTTP Request: POST /api/teams/cards/approval
+    ├── Response Assertion: status 200
+    ├── Duration Assertion: < 2000ms
+    └── Summary Report listener
+```
+
+---
+
+### 21.3 JMeter Test Plan XML (CarbonTeamsBot_TestPlan.jmx)
+
+Save this file and open it in JMeter GUI, or run headless via CLI.
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<jmeterTestPlan version="1.2" properties="5.0">
+  <hashTree>
+    <TestPlan guiclass="TestPlanGui" testclass="TestPlan"
+              testname="Carbon Teams Bot — API Test Plan">
+      <stringProp name="TestPlan.comments">REST API automation and load tests for devbot.iriscarbon.com</stringProp>
+      <boolProp name="TestPlan.functional_mode">false</boolProp>
+      <boolProp name="TestPlan.serialize_threadgroups">true</boolProp>
+      <elementProp name="TestPlan.user_defined_variables" elementType="Arguments">
+        <collectionProp name="Arguments.arguments">
+          <!-- Global variables: edit these before running -->
+          <elementProp name="BASE_URL" elementType="Argument">
+            <stringProp name="Argument.name">BASE_URL</stringProp>
+            <stringProp name="Argument.value">devbot.iriscarbon.com</stringProp>
+          </elementProp>
+          <elementProp name="PROTOCOL" elementType="Argument">
+            <stringProp name="Argument.name">PROTOCOL</stringProp>
+            <stringProp name="Argument.value">https</stringProp>
+          </elementProp>
+          <elementProp name="COMPANY_ID" elementType="Argument">
+            <stringProp name="Argument.name">COMPANY_ID</stringProp>
+            <stringProp name="Argument.value">COMP-JMETER-001</stringProp>
+          </elementProp>
+          <elementProp name="CUSTOMER_TENANT_ID" elementType="Argument">
+            <stringProp name="Argument.name">CUSTOMER_TENANT_ID</stringProp>
+            <stringProp name="Argument.value">&lt;CUSTOMER_TENANT_GUID&gt;</stringProp>
+          </elementProp>
+          <elementProp name="OWNER_UPN" elementType="Argument">
+            <stringProp name="Argument.name">OWNER_UPN</stringProp>
+            <stringProp name="Argument.value">admin@yourtenant.com</stringProp>
+          </elementProp>
+        </collectionProp>
+      </elementProp>
+    </TestPlan>
+    <hashTree>
+
+      <!-- ================================================================ -->
+      <!-- THREAD GROUP 1: Smoke Tests (sequential, 1 user, 1 pass)         -->
+      <!-- ================================================================ -->
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup"
+                   testname="Smoke Tests — Full Provisioning Flow">
+        <intProp name="ThreadGroup.num_threads">1</intProp>
+        <intProp name="ThreadGroup.ramp_time">1</intProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">stoptestnow</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+          <intProp name="LoopController.loops">1</intProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+
+        <!-- Header Manager (shared by all requests) -->
+        <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager"
+                       testname="Content-Type Header">
+          <collectionProp name="HeaderManager.headers">
+            <elementProp name="" elementType="Header">
+              <stringProp name="Header.name">Content-Type</stringProp>
+              <stringProp name="Header.value">application/json</stringProp>
+            </elementProp>
+          </collectionProp>
+        </HeaderManager>
+        <hashTree/>
+
+        <!-- Step 1: Provision Team -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy"
+                          testname="POST /api/teams/provision/team">
+          <stringProp name="HTTPSampler.domain">${BASE_URL}</stringProp>
+          <stringProp name="HTTPSampler.protocol">${PROTOCOL}</stringProp>
+          <stringProp name="HTTPSampler.path">/api/teams/provision/team</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <stringProp name="Argument.value">{
+  "companyId": "${COMPANY_ID}",
+  "customerTenantId": "${CUSTOMER_TENANT_ID}",
+  "teamDisplayName": "JMeter Test Team",
+  "teamDescription": "Created by JMeter smoke test",
+  "owners": ["${OWNER_UPN}"],
+  "members": []
+}</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <!-- Assert HTTP 200 -->
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion"
+                             testname="Assert 200">
+            <collectionProp name="Asserion.test_strings">
+              <stringProp>200</stringProp>
+            </collectionProp>
+            <intProp name="Assertion.test_type">2</intProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+          </ResponseAssertion>
+          <!-- Extract teamId -->
+          <JSONPathExtractor guiclass="JSONPathExtractorGui" testclass="JSONPathExtractor"
+                             testname="Extract teamId">
+            <stringProp name="JSONPathExtractor.referenceName">TEAM_ID</stringProp>
+            <stringProp name="JSONPathExtractor.jsonPathExpr">$.teamId</stringProp>
+            <stringProp name="JSONPathExtractor.defaultValue">TEAM_ID_NOT_FOUND</stringProp>
+          </JSONPathExtractor>
+          <hashTree/>
+        </hashTree>
+
+        <!-- Step 2: Provision Channel -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy"
+                          testname="POST /api/teams/provision/channel">
+          <stringProp name="HTTPSampler.domain">${BASE_URL}</stringProp>
+          <stringProp name="HTTPSampler.protocol">${PROTOCOL}</stringProp>
+          <stringProp name="HTTPSampler.path">/api/teams/provision/channel</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <stringProp name="Argument.value">{
+  "companyId": "${COMPANY_ID}",
+  "customerTenantId": "${CUSTOMER_TENANT_ID}",
+  "teamId": "${TEAM_ID}",
+  "channelName": "carbon-approvals",
+  "description": "JMeter test channel"
+}</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion"
+                             testname="Assert 200">
+            <collectionProp name="Asserion.test_strings"><stringProp>200</stringProp></collectionProp>
+            <intProp name="Assertion.test_type">2</intProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+          </ResponseAssertion>
+          <JSONPathExtractor guiclass="JSONPathExtractorGui" testclass="JSONPathExtractor"
+                             testname="Extract channelId">
+            <stringProp name="JSONPathExtractor.referenceName">CHANNEL_ID</stringProp>
+            <stringProp name="JSONPathExtractor.jsonPathExpr">$.channelId</stringProp>
+            <stringProp name="JSONPathExtractor.defaultValue">CHANNEL_ID_NOT_FOUND</stringProp>
+          </JSONPathExtractor>
+          <hashTree/>
+        </hashTree>
+
+        <!-- Step 3: Map Org to Channel -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy"
+                          testname="POST /api/teams/channels (map org)">
+          <stringProp name="HTTPSampler.domain">${BASE_URL}</stringProp>
+          <stringProp name="HTTPSampler.protocol">${PROTOCOL}</stringProp>
+          <stringProp name="HTTPSampler.path">/api/teams/channels</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <stringProp name="Argument.value">{
+  "companyId": "${COMPANY_ID}",
+  "teamId": "${TEAM_ID}",
+  "channelId": "${CHANNEL_ID}",
+  "tenantId": "${CUSTOMER_TENANT_ID}"
+}</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion"
+                             testname="Assert 200">
+            <collectionProp name="Asserion.test_strings"><stringProp>200</stringProp></collectionProp>
+            <intProp name="Assertion.test_type">2</intProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+          </ResponseAssertion>
+        </hashTree>
+
+        <!-- Step 4: Post Approval Card -->
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy"
+                          testname="POST /api/teams/cards/approval">
+          <stringProp name="HTTPSampler.domain">${BASE_URL}</stringProp>
+          <stringProp name="HTTPSampler.protocol">${PROTOCOL}</stringProp>
+          <stringProp name="HTTPSampler.path">/api/teams/cards/approval</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <stringProp name="Argument.value">{
+  "companyId": "${COMPANY_ID}",
+  "sectionId": "SEC-JMETER-001",
+  "documentId": "DOC-JMETER-001",
+  "documentVersion": "v1",
+  "sectionName": "JMeter Test Section",
+  "lastEditor": "jmeter@test.com",
+  "lastEditedUtc": "2026-04-16T10:00:00Z",
+  "workflowState": "PENDING_APPROVAL",
+  "sectionVersionHash": "jmeter-hash-001",
+  "lastModifiedUtc": "2026-04-16T10:00:00Z"
+}</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion"
+                             testname="Assert 200">
+            <collectionProp name="Asserion.test_strings"><stringProp>200</stringProp></collectionProp>
+            <intProp name="Assertion.test_type">2</intProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+          </ResponseAssertion>
+          <!-- Duration assertion: must respond within 2 seconds -->
+          <DurationAssertion guiclass="DurationAssertionGui" testclass="DurationAssertion"
+                             testname="Response time &lt; 2000ms">
+            <stringProp name="DurationAssertion.duration">2000</stringProp>
+          </DurationAssertion>
+          <JSONPathExtractor guiclass="JSONPathExtractorGui" testclass="JSONPathExtractor"
+                             testname="Extract cardInstanceId">
+            <stringProp name="JSONPathExtractor.referenceName">CARD_INSTANCE_ID</stringProp>
+            <stringProp name="JSONPathExtractor.jsonPathExpr">$.cardInstanceId</stringProp>
+            <stringProp name="JSONPathExtractor.defaultValue">CARD_ID_NOT_FOUND</stringProp>
+          </JSONPathExtractor>
+          <hashTree/>
+        </hashTree>
+
+        <!-- Summary Report -->
+        <ResultCollector guiclass="SummaryReport" testclass="ResultCollector"
+                         testname="Smoke Test Summary">
+          <boolProp name="ResultCollector.error_logging">false</boolProp>
+          <objProp>
+            <name>saveConfig</name>
+            <value class="SampleSaveConfiguration">
+              <time>true</time>
+              <latency>true</latency>
+              <responseCode>true</responseCode>
+              <responseMessage>true</responseMessage>
+              <threadName>true</threadName>
+              <success>true</success>
+            </value>
+          </objProp>
+          <stringProp name="filename">results/smoke-test-results.jtl</stringProp>
+        </ResultCollector>
+        <hashTree/>
+
+      </hashTree>
+
+      <!-- ================================================================ -->
+      <!-- THREAD GROUP 2: Load Test — Post Approval Cards                  -->
+      <!-- ================================================================ -->
+      <ThreadGroup guiclass="ThreadGroupGui" testclass="ThreadGroup"
+                   testname="Load Test — Post Approval Cards (50 users)">
+        <intProp name="ThreadGroup.num_threads">50</intProp>
+        <intProp name="ThreadGroup.ramp_time">30</intProp>
+        <boolProp name="ThreadGroup.same_user_on_next_iteration">true</boolProp>
+        <stringProp name="ThreadGroup.on_sample_error">continue</stringProp>
+        <elementProp name="ThreadGroup.main_controller" elementType="LoopController">
+          <boolProp name="LoopController.continue_forever">false</boolProp>
+          <intProp name="LoopController.loops">10</intProp>
+        </elementProp>
+      </ThreadGroup>
+      <hashTree>
+
+        <HeaderManager guiclass="HeaderPanel" testclass="HeaderManager"
+                       testname="Content-Type Header">
+          <collectionProp name="HeaderManager.headers">
+            <elementProp name="" elementType="Header">
+              <stringProp name="Header.name">Content-Type</stringProp>
+              <stringProp name="Header.value">application/json</stringProp>
+            </elementProp>
+          </collectionProp>
+        </HeaderManager>
+        <hashTree/>
+
+        <HTTPSamplerProxy guiclass="HttpTestSampleGui" testclass="HTTPSamplerProxy"
+                          testname="POST /api/teams/cards/approval (load)">
+          <stringProp name="HTTPSampler.domain">${BASE_URL}</stringProp>
+          <stringProp name="HTTPSampler.protocol">${PROTOCOL}</stringProp>
+          <stringProp name="HTTPSampler.path">/api/teams/cards/approval</stringProp>
+          <stringProp name="HTTPSampler.method">POST</stringProp>
+          <boolProp name="HTTPSampler.postBodyRaw">true</boolProp>
+          <elementProp name="HTTPsampler.Arguments" elementType="Arguments">
+            <collectionProp name="Arguments.arguments">
+              <elementProp name="" elementType="HTTPArgument">
+                <stringProp name="Argument.value">{
+  "companyId": "${COMPANY_ID}",
+  "sectionId": "SEC-LOAD-${__threadNum}",
+  "documentId": "DOC-LOAD-${__threadNum}",
+  "documentVersion": "v${__Random(1,100)}",
+  "sectionName": "Load Test Section ${__threadNum}",
+  "lastEditor": "loadtest@iriscarbon.com",
+  "lastEditedUtc": "2026-04-16T10:00:00Z",
+  "workflowState": "PENDING_APPROVAL",
+  "sectionVersionHash": "hash-${__threadNum}-${__Random(1000,9999)}",
+  "lastModifiedUtc": "2026-04-16T10:00:00Z"
+}</stringProp>
+              </elementProp>
+            </collectionProp>
+          </elementProp>
+        </HTTPSamplerProxy>
+        <hashTree>
+          <ResponseAssertion guiclass="AssertionGui" testclass="ResponseAssertion"
+                             testname="Assert 200">
+            <collectionProp name="Asserion.test_strings"><stringProp>200</stringProp></collectionProp>
+            <intProp name="Assertion.test_type">2</intProp>
+            <stringProp name="Assertion.test_field">Assertion.response_code</stringProp>
+          </ResponseAssertion>
+          <DurationAssertion guiclass="DurationAssertionGui" testclass="DurationAssertion"
+                             testname="Response time &lt; 2000ms">
+            <stringProp name="DurationAssertion.duration">2000</stringProp>
+          </DurationAssertion>
+        </hashTree>
+
+        <!-- Aggregate Report -->
+        <ResultCollector guiclass="StatVisualizer" testclass="ResultCollector"
+                         testname="Load Test Aggregate Report">
+          <boolProp name="ResultCollector.error_logging">false</boolProp>
+          <objProp>
+            <name>saveConfig</name>
+            <value class="SampleSaveConfiguration">
+              <time>true</time>
+              <latency>true</latency>
+              <responseCode>true</responseCode>
+              <success>true</success>
+            </value>
+          </objProp>
+          <stringProp name="filename">results/load-test-results.jtl</stringProp>
+        </ResultCollector>
+        <hashTree/>
+
+      </hashTree>
+
+    </hashTree>
+  </hashTree>
+</jmeterTestPlan>
+```
+
+---
+
+### 21.4 Run JMeter from Command Line (Headless)
+
+```bash
+# Run smoke tests headless and generate HTML report
+jmeter -n \
+  -t CarbonTeamsBot_TestPlan.jmx \
+  -l results/smoke-test-results.jtl \
+  -e \
+  -o results/smoke-report
+
+# Open results/smoke-report/index.html in browser to view full report
+
+# Run only the smoke test thread group (disable load test in GUI first,
+# or use a separate .jmx for each group)
+jmeter -n -t SmokeTests.jmx -l results/smoke.jtl
+
+# Assert 0 errors from CI pipeline:
+jmeter -n -t CarbonTeamsBot_TestPlan.jmx -l results/results.jtl
+# Then check: errors column in results.jtl should be 0
+```
+
+### 21.5 Expected Performance Benchmarks
+
+| Endpoint | Expected P95 | Acceptable P99 |
+|---|---|---|
+| POST `/api/teams/provision/team` | < 5 000 ms | < 10 000 ms |
+| POST `/api/teams/provision/channel` | < 3 000 ms | < 6 000 ms |
+| POST `/api/teams/channels` | < 500 ms | < 1 000 ms |
+| POST `/api/teams/cards/approval` | < 1 500 ms | < 2 000 ms |
+| GET `/api/consent/url` | < 100 ms | < 200 ms |
+
+> Team and Channel provisioning is slow because they call Graph API externally — latency is dominated by Microsoft's servers, not your IIS server.
+
+---
+
+*End of Implementation Guide — Version 1.1 — 2026-04-16*
